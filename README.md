@@ -31,11 +31,10 @@ Our work consists of a trainable cross attention stream, running in parallel to 
 ### Interpretable Evaluation
 
 ### Citation
-@misc\{torres2024castream,<\br>
-      title=\{CA-Stream: Attention-based pooling for interpretable image recognition\},<\br>
-      author=\{Felipe Torres and Hanwei Zhang and Ronan Sicre and Stéphane Ayache and Yannis Avrithis\},<\br>
-      year=\{2024\},<\br>
-      eprint=\{2404.14996\},<\br>
-      archivePrefix=\{arXiv\},<\br>
-      \}
+
+@misc\{torres2024castream,</br>
+title=\{CA-Stream: Attention-based pooling for interpretable image recognition\},</br>
+author=\{Felipe Torres and Hanwei Zhang and Ronan Sicre and Stéphane Ayache and Yannis Avrithis\},</br>
+year=\{2024\}</br>
+\}
 ### Acknowledgements
