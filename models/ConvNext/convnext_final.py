@@ -296,7 +296,7 @@ def convnext_large(*,
     return _convnext(block_setting, stochastic_depth_prob, weights, progress, **kwargs)
 
 # ConvNext models, off the shelf
-dict_v3={'convnext_tiny_v3': convnext_tiny,
-         'convnext_small_v3': convnext_small,
-         'convnext_base_v3': convnext_base,
-         'convnext_large_v3': convnext_large}
+dict_convnext_final={'convnext_tiny_final': convnext_tiny,
+                     'convnext_small_final': convnext_small,
+                     'convnext_base_final': convnext_base,
+                     'convnext_large_final': convnext_large}

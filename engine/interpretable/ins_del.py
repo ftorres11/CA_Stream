@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-# Author: Felipe Torres Figueroa - felipe.torres@lis-lab.fr
+# Author: Felipe Torres Figueroa -
+# felipe.torres@lis-lab.fr - felitf.94@gmail.com
 # Code base from: https://github.com/eclique/RISE/blob/master/evaluation.py
 
 # Torch Imports
@@ -13,7 +14,6 @@ import copy
 import numpy as np
 from tqdm import tqdm
 from scipy.ndimage.filters import gaussian_filter
-import pdb
 
 
 # ========================================================================
@@ -81,9 +81,7 @@ class CausalMetric():
         assert n_samples % batch_size == 0
         
         # Forwarding
-        #predictions = self.model(img_batch)
         top = top.cpu()
-        #top = torch.argmax(predictions.detach(), dim=-1).cpu()
         scores = torch.zeros((n_steps + 1, n_samples)).cpu()
 
         # Generating the starting image-reconstruction to forward

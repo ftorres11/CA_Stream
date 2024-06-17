@@ -39,13 +39,9 @@ import time
 
 
 # ========================================================================
-dict_methods = {'cam': cam_processing}
-                #'raw_attention': raw_attention,
-                #'rollout_attention': rollout_attention,
-                #'ronan_attention': ronan_attention,
-                #'hybrid_cam': gradcam_cls,
-                #'cam_cam': gradcam_gradcam,
-                #'hybrid_ham': hybrid_ham}
+dict_methods = {'cam': cam_processing,
+                'raw_attention': raw_attention,
+                'rollout_attention': rollout_attention}
 
 
 # ========================================================================
@@ -66,13 +62,8 @@ def activation_extractor(wrapper, images, labels, args):
             labels = torch.argmax(logits, dim=-1)
         score = gradient_generation(logits, labels)
     args.labels = labels
-    if args.method == 'cam_cam':
-        logits, activations = dict_methods[approach](wrapper, features,
-                                                     score, images, args)
-    elif (args.method == 'gradcam' or args.method == 'gradcampp' or\
-          args.method == 'scorecam'):
-        
-        activations = dict_methods['cam'](wrapper, features, score, images,
+
+    activations = dict_methods['cam'](wrapper, features, score, images,
                                           args)
 
     #return logits, activations, cl_r
@@ -235,14 +226,10 @@ def single_evaluator(wrapper, images, labels, acc_metric, missclassified,
             logits, salient  = activation_extractor(wrapper, images,
                                                     labels, args)
 
-            # Diagnostics
-            #logits, salient, cl_r  = activation_extractor(wrapper, images,
-            #                                           labels, args)
         else:
             logits, salient = saliency_extractor(wrapper, images, labels,
                                                  args)
         saliency_storer(salient, args)
-        #diagnostic_storer(logits, salient, cl_r, args)
 
     else:
         logits = wrapper.model(images)

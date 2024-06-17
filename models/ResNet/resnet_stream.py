@@ -11,7 +11,7 @@ from torch import Tensor
 from torchvision.models import resnet
 
 # In package imports
-from models.transformer import CLS_KV, Conv_Shared
+from models.transformer import CLS_Attention, Light_Shared
 
 # Package imports
 from einops import rearrange, repeat
@@ -160,17 +160,19 @@ class ResNet(nn.Module):
                  groups: int = 1, width_per_group: int = 64,
                  replace_stride_with_dilation: Optional[List[bool]] = None,
                  norm_layer: Optional[Callable[..., nn.Module]] = None,
-                 project: bool=False, fixed_dim: bool=False,
-                 dropout: float = 0., heads: int=1,
-                 shared: bool=False 
+                 project: bool = True, dropout: float = 0., heads: int = 1
                  ) -> None:
+
         super(ResNet, self).__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
+
         self._norm_layer = norm_layer
+        self.project = project
+        self.num_classes = num_classes
+
         self.inplanes = 64
         self.dilation = 1
-        self.shared = shared
         if replace_stride_with_dilation is None:
             # each element in the tuple indicates if we should replace
             # the 2x2 stride with a dilated convolution instead
@@ -195,28 +197,11 @@ class ResNet(nn.Module):
                                        dilate=replace_stride_with_dilation[1])
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
                                        dilate=replace_stride_with_dilation[2])
-        self.project = project
-
-        if self.shared:
-            ones_cls = torch.ones((1, 1, 256*block.expansion))
-            #self.cls_surrogate = Light_Shared(dim_head=512*block.expansion,
-            #                                  heads=heads,
-            #                                  project_out=self.project)    
-            self.cls_surrogate = Conv_Shared(dim_head=512*block.expansion,
-                                              heads=heads,
-                                              project_out=self.project)    
-           
-        else:
-            ones_cls = torch.ones((1, 1, 512*block.expansion))
-            self.cls_surrogate = CLS_KV(dim=512*block.expansion,
-                                        heads=1,
-                                        dim_head=512*block.expansion,
-                                        ch_scaling=block.expansion*512,
-                                        project_out=project)
-       
-        self.cls_token = nn.Parameter(torch.normal(mean=ones_cls,
-                                                   std=ones_cls))
         self.fc = nn.Linear(512*block.expansion, num_classes)
+
+        # Transformer stream parameters
+        # Self Attention type
+        self._increasing_layers(block, heads, dropout)
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -268,29 +253,73 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
+    def _make_increasing(self, depth: int=512, dim_head: int=256,
+                         heads: int=1, dropout: float=0.,
+                         project: bool=True):
+        layer = CLS_Attention(depth, heads=heads, dim_head=dim_head,
+                              project_out=project,
+                              dropout=dropout)
+
+        return layer
+
+    def _increasing_layers(self, block, heads, dropout):
+        # CLS Token
+        ones_cls = torch.ones((1, 1, 64))
+
+        self.cls_token = nn.Parameter(torch.normal(mean=ones_cls,
+                                                   std=ones_cls),
+                                                   requires_grad=True)
+        
+        self.base = self._make_increasing(depth=block.expansion*64,
+                                          dim_head=64, heads=heads,
+                                          dropout=dropout)
+
+        self.l1 = self._make_increasing(depth=block.expansion*128,
+                                        dim_head=block.expansion*64,
+                                        heads=heads,
+                                        dropout=dropout)
+
+        self.l2 = self._make_increasing(depth=block.expansion*256,
+                                        dim_head=block.expansion*128,
+                                        heads=heads,
+                                        dropout=dropout)
+
+        self.l3 = self._make_increasing(depth=block.expansion*512,
+                                        dim_head=block.expansion*256,
+                                        heads=heads,
+                                        dropout=dropout)
+
+        self.l4 = self._make_increasing(depth=block.expansion*512,
+                                        dim_head=block.expansion*512,
+                                        heads=heads,
+                                        dropout=0)
+
     def _forward_impl(self, x: Tensor) -> Tensor:
         # See note [TorchScript super()]
         b, n, _, _ = x.shape
         cls_tokens = repeat(self.cls_token, '1 n d -> b n d', b = b)
         cls_tokens = cls_tokens.unsqueeze(1)
-
+        
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
         x = self.maxpool(x)
 
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x0 = x
-        x = self.layer4(x)        
-        if self.shared:
-            attn, cls_tokens = self.cls_surrogate(x0, cls_tokens,
-                                                  self.layer4)
-        else:
-            attn, cls_tokens = self.cls_surrogate(x, cls_tokens)
+        attn, cls_tokens = self.base(x, cls_tokens)
 
+        x = self.layer1(x)
+        attn, cls_tokens = self.l1(x, cls_tokens)
+
+        x = self.layer2(x)
+        attn, cls_tokens = self.l2(x, cls_tokens)
+
+        x = self.layer3(x)
+        attn, cls_tokens = self.l3(x, cls_tokens)
+    
+        x = self.layer4(x)
+        attn, cls_tokens = self.l4(x, cls_tokens)
         cls_tokens = torch.flatten(cls_tokens, 1)
+        
         x = self.fc(cls_tokens)
         return x
 
@@ -388,7 +417,7 @@ def resnet152(pretrained: bool = False, progress: bool = True,
         stderr
     """
     return _resnet('resnet152', Bottleneck, [3, 8, 36, 3], pretrained,
-                   progress, project, asclassifier, **kwargs)
+                   progress, project,  **kwargs)
 
 
 def resnext50_32x4d(pretrained: bool = False, progress: bool = True,
@@ -406,7 +435,7 @@ def resnext50_32x4d(pretrained: bool = False, progress: bool = True,
     kwargs['groups'] = 32
     kwargs['width_per_group'] = 4
     return _resnet('resnext50_32x4d', Bottleneck, [3, 4, 6, 3],
-                   pretrained, progress, project, asclassifier, **kwargs)
+                   pretrained, progress, project,  **kwargs)
 
 
 def resnext101_32x8d(pretrained: bool = False, progress: bool = True,
@@ -424,7 +453,7 @@ def resnext101_32x8d(pretrained: bool = False, progress: bool = True,
     kwargs['groups'] = 32
     kwargs['width_per_group'] = 8
     return _resnet('resnext101_32x8d', Bottleneck, [3, 4, 23, 3],
-                   pretrained, progress, project, asclassifier, **kwargs)
+                   pretrained, progress, project, **kwargs)
 
 
 def wide_resnet50_2(pretrained: bool = False, progress: bool = True,
@@ -445,11 +474,11 @@ def wide_resnet50_2(pretrained: bool = False, progress: bool = True,
     """
     kwargs['width_per_group'] = 64 * 2
     return _resnet('wide_resnet50_2', Bottleneck, [3, 4, 6, 3],
-                   pretrained, progress, project, asclassifier, **kwargs)
+                   pretrained, progress, project, **kwargs)
 
 
 def wide_resnet101_2(pretrained: bool = False, progress: bool = True,
-                     project: bool = False, 
+                     project: bool = False,
                      **kwargs: Any) -> ResNet:
     r"""Wide ResNet-101-2 model from
     The model is the same as ResNet except for the bottleneck number of channels
@@ -464,16 +493,16 @@ def wide_resnet101_2(pretrained: bool = False, progress: bool = True,
     """
     kwargs['width_per_group'] = 64 * 2
     return _resnet('wide_resnet101_2', Bottleneck, [3, 4, 23, 3],
-                   pretrained, progress, project, asclassifier, **kwargs)
+                   pretrained, progress, project, **kwargs)
 
 
 # ========================================================================
-dict_resnet_v3 ={'resnet18_v3': resnet18,
-                'resnet34_v3': resnet34,
-                'resnet50_v3': resnet50,
-                'resnet101_v3': resnet101,
-                'resnet152_v3': resnet152,
-                'resnext50_32x4d_v3': resnext50_32x4d,
-                'resnext101_32x8d_v3': resnext101_32x8d,
-                'wide_resnet50_2_v3': wide_resnet50_2,
-                'wide_resnet101_2_v3': wide_resnet101_2}
+dict_resnet_stream ={'resnet18_stream': resnet18,
+             'resnet34_stream': resnet34,
+             'resnet50_stream': resnet50,
+             'resnet101_stream': resnet101,
+             'resnet152_stream': resnet152,
+             'resnext50_32x4d_stream': resnet.resnext50_32x4d,
+             'resnext101_32x8d_stream': resnext101_32x8d,
+             'wide_resnet50_2_stream': wide_resnet50_2,
+             'wide_resnet101_2_stream': wide_resnet101_2}

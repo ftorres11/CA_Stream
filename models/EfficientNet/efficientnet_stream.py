@@ -798,11 +798,11 @@ def efficientnet_v2_l(
     )
 
 # Porting models towards cls
-dict_efficient_clsv1={'efficientnet_b0_clsv1': efficientnet_b0,
-                      'efficientnet_b1_clsv1': efficientnet_b1,
-                      'efficientnet_b2_clsv1': efficientnet_b2,
-                      'efficientnet_b3_clsv1': efficientnet_b3,
-                      'efficientnet_b4_clsv1': efficientnet_b4,
-                      'efficientnet_b5_clsv1': efficientnet_b5,
-                      'efficientnet_b6_clsv1': efficientnet_b6}
+dict_efficient_stream={'efficientnet_b0_stream': efficientnet_b0,
+                       'efficientnet_b1_stream': efficientnet_b1,
+                       'efficientnet_b2_stream': efficientnet_b2,
+                       'efficientnet_b3_stream': efficientnet_b3,
+                       'efficientnet_b4_stream': efficientnet_b4,
+                       'efficientnet_b5_stream': efficientnet_b5,
+                       'efficientnet_b6_stream': efficientnet_b6}
 # Add more for those extra experiments

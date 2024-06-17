@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-# Author: Felipe Torres Figueroa, felipe.torres@lis-lab.fr
+# Author: Felipe Torres Figueroa
+# Contact: felitf.94@gmail.com - felipe.torres@lis-lab.fr
 
 # Torch imports
 import torch
 import torch.nn as nn
 from torchvision import datasets, transforms
 from torch.utils.data import Dataset, DataLoader, distributed
+import random
 
 # In package imports
 from .utils import seed_worker
@@ -19,7 +21,6 @@ from PIL import Image
 
 osp = os.path
 osj = osp.join
-
 
 # ========================================================================
 # Normalization and de-normalization
@@ -89,31 +90,34 @@ dict_validation = {'CIFAR10': CIFAR10_val, 'CIFAR100': CIFAR100_val,
                    'MNIST': MNIST_val}
 
 # ========================================================================
-def train_splitter(dataset, fraction):
+def train_splitter(dataset, fraction, seed=0):
+    random.seed(seed)
     data_length = len(dataset)
     real_size = int(data_length*fraction)
-    permuted_val = [int(x) for x in np.random.permutation(real_size)]
-    permuted_train = []
-    for x in range(data_length):
-        if x not in permuted_val:
-            permuted_train.append(x)
+    all_data = [*range(data_length)]
+    random.shuffle(all_data)
+    permuted_val = all_data[0:real_size]
+    permuted_train = all_data[real_size::]
     return permuted_train, permuted_val
 
 # ========================================================================
-def imagenet_trainer(size):
+def imagenet_trainer(size, crop_size):
     RRC = transforms.RandomResizedCrop
+    # Adjust for EfficientNet sizes
     inet_trans = transforms.Compose([transforms.Resize((size, size)),
-                                     RRC((size,size)),
+                                     RRC((crop_size, crop_size)),
                                      transforms.RandomHorizontalFlip(),
                                      transforms.ToTensor(),
+                                     transforms.ColorJitter(0.4),
                                      transforms.ConvertImageDtype(\
                                      torch.float),
                                      im_normalization])
     return inet_trans
 
 # ========================================================================
-def imagenet_tester(size):
-    inet_trans = transforms.Compose([transforms.Resize((size, size)),
+def imagenet_tester(size, crop_size):
+    inet_trans = transforms.Compose([transforms.CenterCrop
+				     transforms.Resize((size, size)),
                                      transforms.ToTensor(),
                                      transforms.ConvertImageDtype(\
                                      torch.float),
@@ -121,42 +125,38 @@ def imagenet_tester(size):
     return  inet_trans
 
 # ========================================================================
-def dataset_wrapper(loader, size, rank, args):
-    sampler = distributed.DistributedSampler(loader,
-                  num_replicas=size, rank=rank)
+def dataset_wrapper(loader, size, rank, collate_fn, args):
+    if size > 1:
+        sampler = distributed.DistributedSampler(loader,
+                      num_replicas=size, rank=rank, shuffle=True)
+    else:
+        sampler = None
 
     # Runs data loading/sampling with a fixed seed if desired
     if args.fixed:
         gen = torch.Generator()
         gen.manual_seed(args.seed)
+        torch.backends.cudnn.deterministic = True
         data = DataLoader(loader, batch_size=args.batch_size,
-                          num_workers=0,
+                          num_workers=args.cpus_task,
                           sampler=sampler,
                           worker_init_fn=seed_worker,
                           generator=gen,
-                          shuffle=False)
+                          shuffle=False if sampler else True,
+                          drop_last=True,
+                          collate_fn=collate_fn)
     else:
         data = DataLoader(loader, batch_size=args.batch_size,
-                num_workers=0,
-                sampler=sampler)
+                num_workers=args.cpus_task,
+                sampler=sampler,
+                drop_last=True,
+                shuffle=False if sampler else True,
+                collate_fn=collate_fn)
         
-    return data
+    return data, sampler
 
 # ========================================================================
 # Classes
-# ========================================================================
-class split_MNIST(Dataset):
-    def __init__(self, dataset, id_list):
-        self.id_list = id_list
-        self.dataset = dataset
-    def __getitem__(self, x):
-        image = self.dataset[self.id_list[x]][0]
-        label = self.dataset[self.id_list[x]][1]
-        return image, label
-
-    def __len__(self):
-        return len(self.id_list)
-
 # ========================================================================
 class INet_Trainer(Dataset):
     def __init__(self, root_data, contents, iterating_list,
@@ -188,33 +188,9 @@ class INet_Evaluator(Dataset):
         self.transform = transform
 
     def __getitem__(self, x):
-        if ',' in self.data[x]:
-            name, label = self.data[x].strip().split(',')
-        else:
-            name, label = self.data[x].strip().split(' ')
-
-        image = Image.open(osj(self.root, name)).convert('RGB')
-        idx = self.ids[x]
-        if self.transform:
-            image = self.transform(image)
-        return image, int(label), idx
-    def __len__(self):
-        return len(self.data)
-
-# ========================================================================
-class INet_wNames(Dataset):
-    def __init__(self, root_path, listed_data, transform=None):
-        self.root = root_path
-        self.data = listed_data
-        self.ids = []
-        for idx, _ in enumerate(listed_data):
-            self.ids.append(idx)
-        self.transform = transform
-
-    def __getitem__(self, x):
         name, label = self.data[x].strip().split(',')
         image = Image.open(osj(self.root, name)).convert('RGB')
-        idx = int(name.split('_')[-1].replace('.JPEG',''))
+        idx = self.ids[x]
         if self.transform:
             image = self.transform(image)
         return image, int(label), idx
@@ -230,68 +206,8 @@ class Salient_Evaluator(Dataset):
     def __getitem__(self, x):
         image, label, indx = self.data[x]
         saliency_map = np.load(osj(self.path, '{}.npy'.format(indx)))
-        return image, label, saliency_map#, indx
+        return image, label, saliency_map
 
     def __len__(self):
         return len(self.data)
-
-# ========================================================================
-class PascalClassifier(Dataset):
-    def __init__(self, root_data, dict_json, transform=None):
-        self.root = root_data
-        self.names = dict_json.keys()
-        self.data = dict_json
-        self.transform = transform
-
-    def __getitem__(self, x):
-        name = self.names[x]
-        labels = self.data[name]
-        image = Image.open(osj(self.root, '{}.jpg'.format(name)))
-        if self.transform:
-            image = self.transform(image)
-        return image, np.asarray(labels), name
-
-    def __len__(self):
-        return(len(self.names))
-
-# ========================================================================
-class Pascal_Evaluator(Dataset):
-    def __init__(self, root_data, dict_json, transform):
-        self.root = root_data
-        self.names = [*dict_json]
-        self.data = dict_json
-        self.transform = transform
-
-    def __getitem__(self, x):
-        name = self.names[x]
-        labels = self.data[name]
-        image = Image.open(osj(self.root, '{}.jpg'.format(name)))
-        if self.transform:
-            image = self.transform(image)
-        return image, np.asarray(labels), name
-
-    def __len__(self):
-        return(len(self.names))
-
-# ========================================================================
-class DiagnosticClass(Dataset):
-    def __init__(self, root_salient, root_diagnostics, listed_data):
-        self.root_salient = root_salient
-        self.root_diagnostics = root_diagnostics
-        self.data = listed_data
-
-    def __getitem__(self, x):
-        name, label = self.data[x].strip().split(',')
-        name = name.replace('.JPEG', '')
-        salient = np.load(osj(self.root_salient, '{}.npy'.format(x)))
-        dict_diag = np.load(osj(self.root_diagnostics,
-                            '{}.npy'.format(x)), allow_pickle=True)
-        dict_diag = dict_diag.item()
-        coeff = dict_diag['w']; gradient = dict_diag['grad'];
-        logs = dict_diag['logits']; reprt = dict_diag['repr']
-        return salient, int(label), coeff, gradient, logs, reprt, name
-
-    def __len__(self):
-        return len(self.data)
-
 

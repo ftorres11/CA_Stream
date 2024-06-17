@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # Author: Felipe Torres Figueroa
+# felipe.torres@lis-lab.fr - felitf.94@gmail.com
 # Modifications and additions added to each function//class with their sources
 
 # Torch imports
@@ -96,7 +97,8 @@ class ResNetPytorchOpt:
         self.optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9,
                              weight_decay=1e-4)
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(\
-                             self.optimizer, milestones=[30, 60, 90], gamma=0.1)
+                             self.optimizer, milestones=[30, 60, 90], 
+                             gamma=0.1)
         self.ema = None
         self.warmup = None
         self.warm_iter = None
@@ -110,7 +112,6 @@ class ResNetPytorchOpt:
 class ViTmodOpt:
     def __init__(self, params, lr=9e-3):
         self.optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=0.3)
-        #self.optimizer = torch.optim.Adam(params, lr=lr, weight_decay=0.1)
 
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(\
                              self.optimizer, T_max=100)

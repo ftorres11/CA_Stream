@@ -7,31 +7,33 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from  torch.nn.parallel import DistributedDataParallel as DPP
+from torch.utils.data.dataloader import default_collate
+from  torch.nn.parallel import DistributedDataParallel as DDP
+
+import torchvision
 
 # Timm imports
-from timm import utils
-from timm.data import Mixup
-
-#from timm.loss import BinaryCrossEntropy
+from timm.models import convert_sync_batchnorm
 from timm.optim import Lamb
-from timm.scheduler import CosineLRScheduler
 
 # In package imports
 from models.utils import weights_loader
-from models import resnet_scrapper
+from models import (backbone_freezer, convnext_scrapper,
+                    efficient_freezer, mobilenet_scrapper, 
+                    resnet_scrapper, resnet_tuner, vit_scrapper) 
 from lib.data import (dataset_wrapper, imagenet_trainer, imagenet_tester,
                       train_splitter, INet_Trainer)
 
-import engine.dpp as dpp
-from engine.utils import WarmUpLR
+import engine.ddp as ddp
+from engine.utils import (distribute_bn, ResNetPytorchOpt, ViTmodOpt,
+                          weight_retriever)
 from engine.routines import (logger, simplified_trainer,
                              simplified_evaluator, 
                              routine_resumer)
+from engine import transforms
 
 # Package imports
 import os
-import pdb
 import copy
 osp = os.path
 osj = osp.join
@@ -40,34 +42,27 @@ import json
 import time
 import argparse
 import warnings
+from functools import partial
 warnings.filterwarnings("ignore")
 
 
 # ========================================================================
 # Basic Configuration Options
 # Loss dictionary for different training losses
-dict_losses = {#'BCELoss': BinaryCrossEntropy,
-               'BCELoss': nn.BCELoss(), 
+dict_losses = {#'BCELoss': BinaryCrossEntropy(target_threshold=0.2),
+               'BCELoss': nn.BCELoss(),
                'BCELogitsLoss': nn.BCEWithLogitsLoss(),
                'CrossEntropy': nn.CrossEntropyLoss(),
                'KLDivLoss': nn.KLDivLoss()}
 
-# Optimizer dictionary
-dict_optimizers = {'Adam': optim.Adam,
-                   'SGD': optim.SGD,
-                   'Lamb': Lamb}
-
-
+dict_recipes = {'resnet_orig': ResNetPytorchOpt,
+                'vit_mod': ViTmodOpt}
 # ========================================================================
 def main():
     parser = argparse.ArgumentParser()
     # Training procedure settings
     parser.add_argument('--epochs', default=20, type=int,
                         help='Training iterations over the dataset')
-    parser.add_argument('--lr', default=1e-3, type=float,
-                        help='Initial learning rate')
-    parser.add_argument('--optimizer', default='Adam', type=str,
-                        help='Optimizer for the training procedure')
     parser.add_argument('--criterion', default='CrossEntropy', type=str,
                         help='Loss Function to use during training')
     parser.add_argument('--print_interval', type=int, default=300,
@@ -76,12 +71,10 @@ def main():
                         help='Resume training from a certain checkpoint')
     parser.add_argument('--use_gpu', action='store_true', default=False,
                         help='Use GPU acceleration for training?')
-    parser.add_argument('--scheduler', default='plateau', type=str,
-                        help='Which learning rate scheduler to use')
-    parser.add_argument('--warm', default=0, type=int,
-                        help='Iterations for warming up')
-    parser.add_argument('--mixup', action='store_true',  default=False,
-                        help='Allowing BCE with Mixup/CutMix?')
+    parser.add_argument('--freeze', action='store_true', default=False,
+                        help='Are we freezing the backbone?')
+    parser.add_argument('--ftune', action='store_true', default=False,
+                        help='Are we fine-tuning the Backbone?')
 
     # Data initialization procedure
     parser.add_argument('--root_data', default=None, type=str,
@@ -90,12 +83,12 @@ def main():
                         help='Training/Validation batch size')
     parser.add_argument('--imsize', default=64, type=int,
                         help='Input size for data')
+    parser.add_argument('--crop_size', default=72, type=int,
+                        help='Input size for cropping')
     parser.add_argument('--store_dir', default='Experiments/Baseline',
                         type=str, help='Where to store the experiment')
     parser.add_argument('--s_iterations', default=15, type=int,
                         help='Store intermediate results every X epochs')
-    parser.add_argument('--process', default='plain', type=str,
-                        help='How to process the data for loss')
     parser.add_argument('--fraction', default=1/6, type=float,
                         help='Fraction to use as  val split')
     parser.add_argument('--path_indexes', default=None, type=str,
@@ -106,6 +99,8 @@ def main():
                         help='Are we using a random seed?')
     parser.add_argument('--seed', default=0, type=int,
                         help='Random seed to use')
+    parser.add_argument('--full', action='store_true', default=False,
+                        help='Using the full set to train?')
 
     # Model Settings
     parser.add_argument('--model', default='Baseline', type=str,
@@ -116,32 +111,38 @@ def main():
                         help='Sets to load a pretrained model')
     parser.add_argument('--pre_path', default='', type=str,
                         help='Pretrained Model Path')
-    parser.add_argument('--multilabel', action='store_true', default=False,
-                        help='Multilabel Setting?')
     parser.add_argument('--interm_store', default=-1, type=int,
                         help='Steps until storing intermediate states')
     parser.add_argument('--project', action='store_true', default=False,
                         help='Projecting when out of SA?')
-    parser.add_argument('--mixed', action='store_true', default=False,
-                        help='Mixing CLS token and avg pooled features?')
-    parser.add_argument('--concat', action='store_true', default=False,
-                        help='Concatenate CLS tokens to avg pooled feats')
-    parser.add_argument('--fixed_depth', action='store_true',
-                        default=False,
-                        help='Are we using a fixed stream depth?')
+    parser.add_argument('--dropout', default=0., type=float,
+                        help='Dropout for the transformer stream')
+    parser.add_argument('--heads', type=int, default=1,
+                        help='heads for multihead self attention')
+    parser.add_argument('--recipe', type=str, default='resnet_orig',
+                        help='Type of recipe to follow during training')
 
     # Parsing Arguments
     args = parser.parse_args()
-    dist.init_process_group(backend='nccl', init_method='env://',
-                            world_size=dpp.size, rank=dpp.rank)
+    args.cpus_task = ddp.cpus_per_task
     # ====================================================================
     # Checking the parsed arguments
-    if not osp.exists(args.store_dir) and dpp.rank == 0:
+    if not osp.exists(args.store_dir) and ddp.rank == 0:
         os.makedirs(args.store_dir)
+
+    try:
+        dist.init_process_group(backend='nccl', init_method='env://',
+                                world_size=ddp.size, rank=ddp.rank)
+
+    except:
+        dist.init_process_group(backend='gloo', init_method='env://',
+                                world_size=ddp.size, rank=ddp.rank)
 
     # Check for gpu acceleration
     if args.use_gpu and torch.cuda.is_available():
-        torch.cuda.set_device(dpp.local_rank)
+        torch.cuda.set_device(ddp.local_rank)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        args.device = torch.device('cuda:%d' % ddp.local_rank)
     else:
         args.device = torch.device('cpu')
 
@@ -157,47 +158,62 @@ def main():
         val_indexes = dict_splits['val']
 
     else:
-        if dpp.local_rank == 0:
+        if ddp.rank == 0 and not args.full:
             print('Splitting data into Train & Val; total data {}'.format(\
                   len(dataset)))
         [train_indexes, val_indexes] = train_splitter(dataset,
-                                                      args.fraction)
-        if dpp.local_rank == 0:
+                                                      args.fraction,
+                                                      args.seed)
+        if ddp.rank == 0 and not args.full:
             print('Split data into train {}, and val {}'.format(\
                   len(train_indexes), len(val_indexes)))
 
         dict_splits = {'train': train_indexes, 'val': val_indexes}
-        with open(osj(args.store_dir, 'sorted_set.txt'), 'w') as output:
-            json.dump(dict_splits, output)
+        #with open(osj(args.store_dir, 'sorted_set.txt'), 'w') as output:
+        #    json.dump(dict_splits, output)
 
     # Generates the dataloader for Tiny ImageNet with the split indexes
-    train_data = INet_Trainer(args.root_data, dataset, train_indexes,
-                              imagenet_trainer(args.imsize))
-    val_data = INet_Trainer(args.root_data, dataset, val_indexes,
-                            imagenet_tester(args.imsize))
+    if args.full:
+        train_data = INet_Trainer(args.root_data, dataset,
+                                  [*range(len(dataset))],
+                                  imagenet_trainer(args.imsize,
+                                  args.crop_size))
+        if ddp.rank == 0:
+            print ('Using the entirety of the training set. '
+                   'Total images {}'.format(len(dataset)))
+    else:
+        train_data = INet_Trainer(args.root_data, dataset, train_indexes,
+                                  imagenet_trainer(args.imsize))
+        val_data = INet_Trainer(args.root_data, dataset, val_indexes,
+                                imagenet_tester(args.crop_size))
 
     # Sets the number of batches given the length of the dataloader
     # If loading from batched data does not divide by the batch siz
     if args.batch_size:
         args.batches_train = len(train_data)//(args.batch_size)
-        args.batches_val = len(val_data)//(args.batch_size)
+        if not args.full:
+            args.batches_val = len(val_data)//(args.batch_size)
     else:
         args.batches_train = len(train_data)
-        args.batches_val = len(val_data)
+        if not args.full:
+            args.batches_val = len(val_data)
 
+    # ====================================================================
     # Loads the model with the correct architecture
-    if 'resnet' in args.model:
+    if 'convnext' in args.model:
+        net = convnext_scrapper(args.model)()
+
+    if 'efficientnet' in args.model:
+        net = efficient_scrapper(args.model)()
+
+    if 'resnet' in args.model: 
         net = resnet_scrapper(args.model)(pretrained=False,
                                           num_classes=args.classes,
-                                          mixed=args.mixed,
-                                          concat=args.concat,
-                                          fixed_dim=args.fixed_depth)
-                                  
-    if 'vgg' in args.model:
-        net = dict_vgg[args.model](pretrained=True,
-                                   num_classes=args.classes)
-        #net.classifier = nn.Linear(512, args.classes)
+                                          project=args.project,
+                                          heads=args.heads)
 
+    net = convert_sync_batchnorm(net)
+    net = net.to(args.device)
     criterion = dict_losses[args.criterion]
     # ====================================================================
     last_epoch = 0
@@ -207,176 +223,189 @@ def main():
     # epochs
     if not osp.exists(args.store_dir):
         os.makedirs(args.store_dir)
-    if not osp.exists(osj(args.store_dir, 'optim')):
-        os.makedirs(osj(args.store_dir, 'optim'))
-        
+
     args.tr_iter = 0
     args.vl_iter = 0
-    net = net.to(torch.device("cuda"))
-    net = DPP(net, device_ids=[dpp.local_rank])
-
+    # ====================================================================
     # Choosing parameters to optimize:
-    params = net.parameters()
-
-    # Choosing the proper optimizer
-    if args.optimizer == 'Adam':
-        optimizer = dict_optimizers[args.optimizer](params,
-                                                    args.lr)
-    if args.optimizer == 'SGD':
-        optimizer = dict_optimizers[args.optimizer](params,
-                                                    args.lr, momentum=.9,
-                                                    weight_decay=5e-4)
-    if args.optimizer == 'Lamb':
-        optimizer = dict_optimizers[args.optimizer](params,
-                                                    args.lr,
-                                                    weight_decay=0.02)
+    if args.ftune or args.increased:
+        bbone_params, cls_params = resnet_tuner(net)
+    elif args.freeze:
+        params = []
+        backbone_freezer(net, params)
+        params = [{'params': param} for param in params]
+    else:
+        params = net.parameters()
     
-    # If loading from a pretrained model, load the weights
+    args.params = params
+    # Choosing from a specific recipe
+    recipe = dict_recipes[args.recipe](params)
+    # Checking for Gradient Clipping
+    args.clip_grad = recipe.clip_grad
+
+    # Checking for Label Smoothing
+    if recipe.label_smoothing != 0:
+        args.labelsmooth=True
+        try:
+            criterion.label_smooth = recipe.label_smoothing
+        except AttributeError:
+            pass
+
+    # Checking for Warm Up
+    if recipe.warm_iter:
+        args.warmup_iter = recipe.warm_iter
+    
+    # Checking for Exponential Moving Average
+    # From https://github.com/pytorch/vision/blob/main/references/classification/train.py
+    if recipe.ema:
+        # model-ema steps = 32
+        args.ema_steps = 32
+        adjust = ddp.size*args.batch_size*args.ema_steps/args.epochs
+        model_ema_decay = 0.99998
+        alpha = 1-model_ema_decay
+        alpha = min(1.0, alpha*adjust)
+        args.ema = recipe.ema(net, decay=1.0 - alpha) 
+    else:
+        args.ema = None
+    
+    optimizer = recipe.optimizer
+    # Loading weights
     if args.pretrained:
-        state_model = torch.load(args.pre_path,
-                                 map_location=lambda storage,
-                                 loc: storage)
-        net_sdic = net.state_dict()
-        names = state_model.keys()
-
-        for key in names:
-            if net_sdic[key].shape == state_model[key].shape:
-                net_sdic[key] = state_model[key]
-
-        net.load_state_dict(net_sdic)
+        weight_retriever(args.pre_path, net)
 
     # If resuming the training, load the previous optimizer, models,
     # epochs, write on a small logger
     args.idx = -1
     args.current_batch = 0
-    if args.resume:
-        routine_summary = routine_resumer(args.store_dir)
-        l_model = routine_summary[0]
-        l_optim = routine_summary[1]
-        last_epoch = routine_summary[2]
-        last_epoch = last_epoch-1
 
-        epoch_iter_tr = len(train_data)//(args.batch_size)
-        epoch_iter_val = len(val_data)//(args.batch_size)
+    # If loading from a pretrained model, load the weights
+    if args.resume and ddp.rank == 0:
+        checkpoint = routine_resumer(args.store_dir)
 
-        try:
-            current_batch = routine_summary[3]
-            total_batches = routine_summary[4]
-            args.tr_iter = last_epoch*(total_batches+current_batch+1)
-            args.val_iter = epoch_iter_val*(last_epoch-1)
+        mode = checkpoint['mode']
+        state_model = checkpoint['model_sdict']
+        state_optim = checkpoint['optim_sdict']
+        last_epoch = checkpoint['epoch']
+        current_batch = checkpoint['batch']
+        args.min_val = checkpoint['loss']
+
+        epoch_iter_tr = len(train_data)//(args.batch_size*ddp.size)
+        epoch_iter_val = len(val_data)//(args.batch_size*ddp.size)
+
+        if mode == 'batch':
+            args.tr_iter = last_epoch*(epoch_iter_tr+current_batch+1)
+            args.val_iter = epoch_iter_val*last_epoch-1
             args.current_batch = current_batch+1
-            if dpp.local_rank == 0:
+            if ddp.local_rank == 0:
                 print('Resuming training at epoch {}, batch {}'.format(\
-                      last_epoch, current_batch))
-        except IndexError:
+                      epoch, current_batch))
+                
+        if mode == 'epoch':
             args.tr_iter = epoch_iter_tr*last_epoch
-            args.val_iter = epoch_iter_val*(last_epoch-1)
-            if dpp.local_rank == 0:
+            args.val_iter = epoch_iter_val*last_epoch-1
+            if ddp.local_rank == 0:
                 print('Resuming training at the begining of epoch'
                       ' {}'.format(last_epoch))
-
-        state_model = torch.load(l_model,
-                                 map_location=lambda storage,
-                                 loc:storage)
-        state_optim = torch.load(l_optim,
-                                 map_location=lambda storage,
-                                 loc:storage)
-
+        
         net.load_state_dict(state_model)
         optimizer.load_state_dict(state_optim)
 
+    # Moving to GPU 
+    net = DDP(net, device_ids=[ddp.local_rank])
+
     # Learning rate scheduler dictionary
-    dict_schedulers={'plateau': optim.lr_scheduler.ReduceLROnPlateau(\
-                   optimizer, factor=.8, patience=4, cooldown=5,
-                   min_lr=1e-10),
-                   'multistep': optim.lr_scheduler.MultiStepLR(optimizer,
-                   milestones=[60, 120, 160], gamma=0.2),
-                   'cosine': CosineLRScheduler(optimizer,
-                                               t_initial=args.epochs,
-                                               warmup_t=args.warm,
-                                               k_decay=8e-3)
-                       }
+    scheduler = recipe.scheduler
     log = logger(args.store_dir, last_epoch)
     args.logger = log
-    scheduling = copy.deepcopy(args.scheduler)
-    args.scheduler = dict_schedulers[args.scheduler]
+
+    if args.resume and recipe.scheduling == 'multistep':
+        recipe.scheduler.step(last_epoch)
+
+    # Last Data preparations: Mixup - Cutmix
+    mixup_transforms = []
+    collate_fn = None
+    if recipe.mixup:
+        mixup_transforms.append(transforms.RandomMixup(args.classes,
+            p=1.0, alpha=recipe.mixup_alpha))
+        mixup_transforms.append(transforms.RandomCutmix(args.classes,
+            p=1.0, alpha=recipe.cutmix_alpha))
+        mixupcutmix = torchvision.transforms.RandomChoice(mixup_transforms)
+        def collate_fn(batch):
+            return mixupcutmix(*default_collate(batch))
 
     # Wrapping inside dataloader
-    train_data = dataset_wrapper(train_data, dpp.size, dpp.rank)
-    val_data = dataset_wrapper(val_data, dpp.size, dpp.rank)
+    train_data, train_sampler = dataset_wrapper(train_data, ddp.size,
+                                                ddp.rank, collate_fn,
+                                                args)
+    if not args.full:
+        val_data, val_sampler = dataset_wrapper(val_data, ddp.size,
+                                                ddp.rank, args)
 
     # ====================================================================
-    # Extra. Mixup - Cutmix
-    if args.mixup:
-        mixup_args = dict(
-                mixup_alpha=0.1,
-                cytmix_alpha=1.0,
-                cutmix_minmax=None,
-                prob=1.0,
-                switch_prob=0.5,
-                mode='batch',
-                label_smoothing=False,
-                num_classes=args.classes)
-
-        args.mixup_fn = Mixup(**mixup_args)
-    
     # Training loop
     for epoch in range(last_epoch+1, args.epochs+1):
         args.epoch = epoch
-        if dpp.local_rank == 0:
+        if ddp.rank == 0:
             print('====== Starting Epoch: {}/{} --> {} ======'.format(epoch,
                   args.epochs, time.strftime("%H:%M:%S")))
         for param_group in optimizer.param_groups:
-            if dpp.local_rank == 0:
+            if ddp.rank == 0:
                 print('Learning Rate: {:.5f}'.format(param_group['lr']))
 
         # Trainining
+        if train_sampler:
+            train_sampler.set_epoch(epoch)
         loss_train, acc_train = simplified_trainer(train_data, net,
                                                    criterion, optimizer,
                                                    args)
 
-        loss_val, acc_val = simplified_evaluator(val_data,
-                                                 net, criterion, args)
+        distribute_bn(net, ddp.size, True)
+        if not args.full:
+            if val_sampler:
+                val_sampler.set_epoch(epoch)
+            loss_val, acc_val = simplified_evaluator(val_data,
+                                                     net, criterion, args)
 
-        if scheduling == 'cosine':
-            args.scheduler.step(epoch)
-        else:
-            if epoch > args.warm:
-                if 'multistep' in scheduling:
-                    args.scheduler.step(loss_train)
-                else:
-                    args.scheduler.step(epoch)
-
+        scheduler.step()
         # Saving the model with the lowest loss
-        if loss_val < args.min_val:
-            args.min_val = loss_val
-            named = osj(args.store_dir, 'best_model.pth')
-
-            torch.save(net.state_dict(), named)
-            if dpp.local_rank == 0:
-                print('Best model saved')
+        if not args.full:
+            if loss_val < args.min_val:
+                args.min_val = loss_val
+                named = osj(args.store_dir, 'best_model.pth')
+                if ddp.rank == 0:
+                    print('Best model saved')
+                    torch.save(net.state_dict(), named)
 
         # Saving every given number of epochs
-        if epoch % args.s_iterations == 0 and dpp.local_rank == 0:
-            model_check = osj(args.store_dir,
-                              'epoch_{}.pth'.format(epoch))
-            optim_check = osj(args.store_dir, 'optim',
-                              'optim_{}.pth'.format(epoch))
+        if epoch % args.s_iterations == 0 and ddp.rank == 0:
+            model_check = osj(args.store_dir, 'checkpoint.pth')
 
-            torch.save(net.state_dict(), model_check)
-            torch.save(optimizer.state_dict(), optim_check)
+            checkpoint_dict = {'mode': 'epoch',
+                               'model_sdict': net.state_dict(),
+                               'optim_sdict': optimizer.state_dict(),
+                               'epoch': epoch,
+                               'batch': 0,
+                               'loss': args.min_val}
+
+            torch.save(checkpoint_dict, model_check)
             print('Checkpoint saved')
 
-        if dpp.rank == 0:
+        if ddp.rank == 0:
             args.logger.update('Epoch Loss: Training', loss_train, epoch)
-            args.logger.update('Epoch Loss: Validation', loss_val, epoch)
-            
             args.logger.update('Epoch Accuracy: Training', acc_train, epoch)
-            args.logger.update('Epoch Accuracy: Validation', acc_val, epoch)
+
+            if not args.full:
+                args.logger.update('Epoch Loss: Validation', loss_val, epoch)
+                args.logger.update('Epoch Accuracy: Validation', acc_val, epoch)
+
             args.logger.flush()
     
-    if dpp.rank == 0:
+    if ddp.rank == 0:
         args.logger.close()
+        model_final = osj(args.store_dir, 'final_epoch.pth')
+        torch.save(net.module.state_dict(), model_final)
+        print('Final model saved')
 
 if __name__ == '__main__':
     main()
+
